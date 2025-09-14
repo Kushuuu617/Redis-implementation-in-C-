@@ -1,26 +1,10 @@
-#include <iostream>
-#include <cstdlib>
-#include <string>
-#include <cstring>
+#include <bits/stdc++.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <thread>
-#include <vector>
-#include <algorithm>
-#include <cctype>
-#include <unordered_map>
-#include <chrono>
-#include <queue>
-#include <deque>
-#include <mutex>
-#include <condition_variable>
-#include <memory>
-#include <fstream>
-#include <sstream>
 
 using namespace std;
 
