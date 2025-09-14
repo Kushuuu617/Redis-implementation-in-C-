@@ -74,7 +74,6 @@ void send_bulk_string(int client_fd, const string &value) {
 // Data store and lists
 unordered_map<string, string> store;
 unordered_map<string, chrono::steady_clock::time_point> expiry;
-// <-- changed to deque for efficient pop_front/push_front
 unordered_map<string, deque<string>> lists;
 
 // RDB configuration parameters
@@ -135,8 +134,6 @@ uint64_t read_size_encoding(ifstream& file) {
             return value;
         }
         case 3: { // 0b11: special encoding
-            // For special encoding, return the first byte as-is
-            // The string encoding function will handle the special encoding
             return first_byte;
         }
         default:
@@ -147,9 +144,7 @@ uint64_t read_size_encoding(ifstream& file) {
 string read_string_encoding(ifstream& file) {
     uint64_t length = read_size_encoding(file);
     
-    // Check if this is a special encoding (0b11)
     if ((length & 0xC0) == 0xC0) {
-        // This is a special encoding, not a regular string
         uint8_t encoding_type = length & 0x3F;
         
         switch (encoding_type) {
@@ -196,13 +191,11 @@ void load_rdb_file() {
         throw runtime_error("Invalid RDB header");
     }
     
-    // Skip metadata section and find database section
     unsigned char byte;
     bool in_database_section = false;
     
     while (file.read(reinterpret_cast<char*>(&byte), 1)) {
         if (byte == 0xFA) { // Metadata subsection
-            // Skip metadata name and value
             read_string_encoding(file); // metadata name
             read_string_encoding(file); // metadata value
         } else if (byte == 0xFE) { // Database subsection
@@ -211,17 +204,12 @@ void load_rdb_file() {
         } else if (byte == 0xFF) { // End of file
             return;
         } else {
-            // This might be the start of key-value pairs without a database marker
             file.seekg(-1, ios::cur); // Go back one byte
             break;
         }
     }
-    
-    // Read database subsection if we found one
     if (in_database_section) {
         uint64_t db_index = read_size_encoding(file);
-        
-        // Read hash table size info
         unsigned char next_byte;
         if (file.read(reinterpret_cast<char*>(&next_byte), 1)) {
             if (next_byte == 0xFB) {
@@ -233,7 +221,6 @@ void load_rdb_file() {
         }
     }
     
-    // Read key-value pairs
     while (file.read(reinterpret_cast<char*>(&byte), 1)) {
         if (byte == 0xFF) { // End of file
             break;
@@ -282,7 +269,6 @@ string to_upper(const string &s) {
     return result;
 }
 
-// Remove any blocked entries for a disconnected fd (simple O(N) cleanup)
 void cleanup_blocked_client_fd(int client_fd) {
     lock_guard<mutex> g(global_mtx);
     for (auto &p : blocked_clients) {
@@ -291,24 +277,20 @@ void cleanup_blocked_client_fd(int client_fd) {
             auto bc = p.second.front();
             p.second.pop();
             if (bc && bc->fd != client_fd) tmp.push(bc);
-            // if bc->fd == client_fd, drop it
         }
         p.second = move(tmp);
     }
     
-    // Also cleanup blocked XREAD clients
     for (auto &p : blocked_xread_clients) {
         queue<shared_ptr<BlockedXReadClient>> tmp;
         while (!p.second.empty()) {
             auto bxc = p.second.front();
             p.second.pop();
             if (bxc && bxc->fd != client_fd) tmp.push(bxc);
-            // if bxc->fd == client_fd, drop it
         }
         p.second = move(tmp);
     }
     
-    // Cleanup transaction state
     transaction_state.erase(client_fd);
     transaction_queues.erase(client_fd);
     
@@ -337,7 +319,7 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
         in_transaction = (transaction_state.find(client_fd) != transaction_state.end());
     }
 
-    // If in transaction and not MULTI/EXEC/DISCARD, queue the command
+    //queue the command
     if (in_transaction && command != "MULTI" && command != "EXEC" && command != "DISCARD") {
         lock_guard<mutex> lock(global_mtx);
         transaction_queues[client_fd].push_back(cmd);
@@ -393,7 +375,7 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
     }
 
     else if (command == "MULTI") {
-        // MULTI command starts a transaction
+        //starts a transaction
         lock_guard<mutex> lock(global_mtx);
         transaction_state[client_fd] = true;
         transaction_queues[client_fd].clear(); // Clear any existing queue
@@ -401,7 +383,7 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
     }
 
     else if (command == "EXEC") {
-        // EXEC command executes all commands queued in a transaction
+        //executes all commands queued in a transaction
         lock_guard<mutex> lock(global_mtx);
         auto it = transaction_state.find(client_fd);
         if (it == transaction_state.end()) {
@@ -419,7 +401,6 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
                 // Execute all queued commands and collect responses
                 vector<string> responses;
                 for (const auto &queued_cmd : queue_it->second) {
-                    // Create a temporary string to capture the response
                     string response;
                     
                     // We need to capture the response from each command
@@ -530,7 +511,6 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
         // Check if key exists
         auto it = store.find(key);
         if (it == store.end()) {
-            // Key doesn't exist - set it to 1
             store[key] = "1";
             string resp = ":1\r\n";
             send(client_fd, resp.c_str(), resp.size(), 0);
@@ -542,31 +522,20 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
         if (exp_it != expiry.end() && chrono::steady_clock::now() > exp_it->second) {
             store.erase(it);
             expiry.erase(exp_it);
-            // Key expired, treat as if it doesn't exist - set it to 1
             store[key] = "1";
             string resp = ":1\r\n";
             send(client_fd, resp.c_str(), resp.size(), 0);
             return;
         }
-        
-        // Try to parse the current value as an integer
         long long current_value;
         try {
             current_value = stoll(it->second);
         } catch (...) {
-            // For this stage, we only handle numerical values
-            // This case will be handled in later stages
             send_error(client_fd, "ERR value is not an integer or out of range");
             return;
         }
-        
-        // Increment the value
         long long new_value = current_value + 1;
-        
-        // Update the store with the new value
         store[key] = to_string(new_value);
-        
-        // Send the response as an integer
         string resp = ":" + to_string(new_value) + "\r\n";
         send(client_fd, resp.c_str(), resp.size(), 0);
     }
@@ -577,8 +546,6 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
           return;
       }
       string key = cmd[1];
-
-      // Capture original length (under lock) so we can compute final length deterministically
       size_t original_len = 0;
       {
           lock_guard<mutex> lock(global_mtx);
@@ -592,16 +559,12 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
           {
               lock_guard<mutex> lock(global_mtx);
               if (!blocked_clients[key].empty()) {
-                  // Serve blocked client (do not append to container)
                   bc = blocked_clients[key].front();
                   blocked_clients[key].pop();
               } else {
-                  // No one waiting, append to list (so container state matches)
                   lists[key].push_back(cmd[i]);
               }
           } 
-
-          // If we found a blocked client, wake it with the pushed value
           if (bc) {
               {
                   lock_guard<mutex> lck(bc->mtx);
@@ -613,15 +576,11 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
 
           pushed_count++;
       }
-
-      // According to Redis behaviour expected by the tests, the RPUSH response
-      // should be the list length *as if* all pushes occurred: original_len + pushed_count
       size_t final_len = original_len + pushed_count;
       string reply = ":" + to_string(final_len) + "\r\n";
       send(client_fd, reply.c_str(), reply.size(), 0);
-  }
-
-
+    }
+        
     else if (command == "LPUSH") {
         if (cmd.size() < 3) {
             send(client_fd, "-ERR wrong number of arguments for 'lpush' command\r\n", 55, 0);
@@ -638,7 +597,7 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
                     bc = blocked_clients[key].front();
                     blocked_clients[key].pop();
                 } else {
-                    lists[key].push_front(cmd[i]); // use push_front for deque
+                    lists[key].push_front(cmd[i]); 
                 }
             }
 
@@ -667,8 +626,6 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
             return;
         }
         string key = cmd[1];
-
-        // Take snapshot inside lock
         deque<string> snapshot;
         {
             lock_guard<mutex> lock(global_mtx);
@@ -677,7 +634,7 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
                 send(client_fd, "*0\r\n", 4, 0);
                 return;
             }
-            snapshot = it->second; // copy for safe iteration outside of further modifications
+            snapshot = it->second; 
         }
 
         int start = 0, stop = 0;
@@ -783,8 +740,7 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
       } catch (...) { 
           timeout_seconds = 0; 
       }
-
-      // Fast path: if there's already data, return immediately
+        
       {
           lock_guard<mutex> lock(global_mtx);
           auto it = lists.find(key);
@@ -798,9 +754,7 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
           }
       }
 
-      // Prepare blocked client
-      auto bc = make_shared<BlockedClient>(); //make shared is a generic which constructs 
-                                              //an object of type T <T> and returns a shared_ptr pointing to it 
+      auto bc = make_shared<BlockedClient>(); 
       bc->fd = client_fd;
       bc->key = key;
 
@@ -809,22 +763,16 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
           blocked_clients[key].push(bc);
       }
 
-      unique_lock<mutex> lk(bc->mtx); //blocked client's mutex so it waits independently
-                                      // Its a felxible RAII lock for mutexes
-
+      unique_lock<mutex> lk(bc->mtx);
       if (timeout_seconds <= 0) {
-          // Block indefinitely
           bc->cv.wait(lk, [&]{ return bc->ready; });
       } else {
-          // Block for timeout_seconds
           auto timeout_duration = chrono::milliseconds((long long)(timeout_seconds * 1000));
           bool woke_up = bc->cv.wait_for(lk, timeout_duration, [&]{ return bc->ready; });
 
           if (!woke_up) {
-              // Timeout: remove from blocked_clients if still there
               {
                   lock_guard<mutex> lock(global_mtx);
-                  // rebuild queue without bc
                   queue<shared_ptr<BlockedClient>> new_q;
                   while (!blocked_clients[key].empty()) {
                       auto front_bc = blocked_clients[key].front();
@@ -840,8 +788,6 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
               return;
           }
       }
-
-      // Send the result once woken
       string resp = "*2\r\n$" + to_string(key.size()) + "\r\n" + key + "\r\n" +
                     "$" + to_string(bc->value.size()) + "\r\n" + bc->value + "\r\n";
       send(client_fd, resp.c_str(), resp.size(), 0);
@@ -885,7 +831,7 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
         long long ms = 0, seq = 0;
         bool auto_seq = false;
         bool auto_time_and_seq = false;
-        bool id_is_auto = (id.find('*') != string::npos); // Track if ID is partially auto
+        bool id_is_auto = (id.find('*') != string::npos); 
 
         if (id == "*") {
             auto_time_and_seq = true;
@@ -909,7 +855,7 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
             }
 
             if (seq_part == "*") {
-                auto_seq = true; // ms fixed, seq auto
+                auto_seq = true;
                 id_is_auto = true;
             } else {
                 try {
@@ -947,7 +893,6 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
                 final_id = to_string(ms) + "-" + to_string(seq);
             }
             else if (auto_seq) {
-                // ms is fixed, seq auto
                 seq = -1;
                 for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
                     long long last_ms, last_seq;
@@ -963,10 +908,8 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
                 final_id = to_string(ms) + "-" + to_string(seq);
             }
             else {
-                // Fully explicit ID
                 final_id = id;
             }
-            // Ordering validation
             if (!entries.empty()) {
                 long long last_ms, last_seq;
                 parse_id(entries.back().first, last_ms, last_seq);
@@ -977,8 +920,6 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
                     send(client_fd, err_msg.c_str(), err_msg.size(), 0);
                     return;
                 }
-
-                // Improved check: true if id is "*" or ends with "-*"
                 bool id_is_partial_auto = (id == "*" || (id.size() > 2 && id.substr(id.size() - 2) == "-*"));
 
                 if (ms < last_ms || (ms == last_ms && seq <= last_seq)) {
@@ -1013,7 +954,6 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
                     if (idx == -1) continue;
 
                     vector<pair<string, unordered_map<string, string>>> matches;
-                    // Only check the new entry that was just added (the last entry)
                     if (!entries.empty()) {
                         auto &new_entry = entries.back();
                         long long ems, eseq;
@@ -1050,8 +990,6 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
         const string key   = cmd[1];
         const string start = cmd[2];
         const string end   = cmd[3];
-
-        // Parse "ms[-seq]" with default seq if omitted.
         auto parse_with_default = [](const string& id, long long default_seq,
                                     long long& ms_out, long long& seq_out) -> bool {
             size_t dash = id.find('-');
@@ -1069,10 +1007,8 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
             }
         };
 
-        const long long MAX_SEQ = 0x7fffffffffffffffLL; // avoid <limits> include
+        const long long MAX_SEQ = 0x7fffffffffffffffLL;
         long long start_ms = 0, start_seq = 0, end_ms = 0, end_seq = 0;
-
-        // Support '-' for start => beginning of stream
         if (start == "-") {
             start_ms = 0;
             start_seq = 0;
@@ -1082,8 +1018,6 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
                 return;
             }
         }
-
-        // Support '+' for end => end of stream
         if (end == "+") {
             end_ms = MAX_SEQ;
             end_seq = MAX_SEQ;
@@ -1093,8 +1027,6 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
                 return;
             }
         }
-
-        // Snapshot the stream under lock
         vector<pair<string, unordered_map<string, string>>> snapshot;
         {
             lock_guard<mutex> lock(global_mtx);
@@ -1106,7 +1038,6 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
             snapshot = it->second;
         }
 
-        // Collect matches (inclusive range)
         vector<pair<string, unordered_map<string, string>>> matches;
         for (auto &entry : snapshot) {
             long long ems, eseq;
@@ -1116,13 +1047,10 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
             if (ge_start && le_end) matches.push_back(entry);
         }
 
-        // Build RESP response: array of [id, [field, value, ...]]
         string resp = "*" + to_string(matches.size()) + "\r\n";
         for (auto &e : matches) {
             resp += "*2\r\n";
-            // ID
             resp += "$" + to_string(e.first.size()) + "\r\n" + e.first + "\r\n";
-            // Field-value list
             resp += "*" + to_string(e.second.size() * 2) + "\r\n";
             for (const auto &kv : e.second) {
                 resp += "$" + to_string(kv.first.size()) + "\r\n"  + kv.first  + "\r\n";
@@ -1133,14 +1061,12 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
     }
 
     else if (command == "KEYS" && cmd.size() == 2) {
-        // KEYS command returns all keys matching the pattern
         string pattern = cmd[1];
         vector<string> matching_keys;
         
         {
             lock_guard<mutex> lock(global_mtx);
             for (const auto& pair : store) {
-                // For this stage, we only support "*" pattern (all keys)
                 if (pattern == "*") {
                     matching_keys.push_back(pair.first);
                 }
@@ -1213,14 +1139,11 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
         for (int i = 0; i < num_streams; ++i) {
             string id_str = cmd[streams_index + 1 + num_streams + i];
             if (id_str == "$") {
-                // Special case: $ means "only new entries"
-                // We'll set this to the maximum ID in the stream, or 0-0 if stream is empty
                 long long max_ms = 0, max_seq = 0;
                 {
                     lock_guard<mutex> lock(global_mtx);
                     auto it = streams.find(keys[i]);
                     if (it != streams.end() && !it->second.empty()) {
-                        // Find the maximum ID in the stream
                         for (const auto &entry : it->second) {
                             long long ems, eseq;
                             if (parse_id(entry.first, ems, eseq)) {
@@ -1243,7 +1166,6 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
             }
         }
 
-        // Fast path: check for immediate matches
         vector<pair<string, vector<pair<string, unordered_map<string,string>>>>> results;
         {
             lock_guard<mutex> lock(global_mtx);
@@ -1315,8 +1237,6 @@ void execute_redis_command(int client_fd, const vector<string> &cmd) {
             }
         }
 
-        // If we reach here, bxc->ready is true and we should have results
-        // If results are empty, it means no new entries were found, so return null
         if (bxc->results.empty()) {
             string null_reply = "$-1\r\n";
             send(client_fd, null_reply.c_str(), null_reply.size(), 0);
@@ -1383,10 +1303,10 @@ int main(int argc, char **argv) {
         string arg = argv[i];
         if (arg == "--dir" && i + 1 < argc) {
             rdb_dir = argv[i + 1];
-            i++; // Skip the next argument since we consumed it
+            i++; 
         } else if (arg == "--dbfilename" && i + 1 < argc) {
             rdb_filename = argv[i + 1];
-            i++; // Skip the next argument since we consumed it
+            i++;
         }
     }
 
